@@ -1,0 +1,447 @@
+#+TITLE:                  MySQL 分区案例
+#+AUTHOR:                 Junahan
+#+EMAIL:                  junahan@outlook.com 
+#+DATE:                   <2019-11-11 Mon>
+#+LANGUAGE:               CN
+#+FILETAGS:               2019 mysql
+#+EXCLUDE_TAGS:           noexport
+#+OPTIONS:                H:3 num:t toc:nil \n:nil @:t ::t |:t ^:nil -:t f:t *:t <:t
+#+OPTIONS:                TeX:nil LaTeX:t skip:nil d:nil todo:t pri:nil tags:not-in-toc
+#+LICENSE:                CC BY 4.0
+#+KEYWORDS:               "MySQL Partition" "MySQL 分区" "MySQL"
+
+# headers for hugo
+#+hugo_base_dir:          ../
+#+hugo_auto_set_lastmod:  t
+#+hugo_tags:              MySQL
+#+hugo_categories:        database 数据库 MySQL
+#+hugo_draft:             true
+
+# info format
+#+INFOJS_OPT:             view:nil toc:nil ltoc:t mouse:underline buttons:0 path:http://orgmode.org/org-info.js
+
+# css for html format
+#+HTML_HEAD:              <link rel="stylesheet" type="text/css" href="https://gongzhitaao.org/orgcss/org.css"/>
+
+#+BEGIN_abstract
+MySQL 服务最近出现了一些性能的问题，特别是对于数据量超过千万规模的数据表。为了对大数据表的性能优化。我们有针对性的研究了 [[https://dev.mysql.com/doc/refman/5.7/en/partitioning.html][MySQL Partitioning]] 方案。这里提供了研究和测试的结果，包括用于测试的脚本、数据和测试结果分析。
+#+END_abstract
+
+#+BEGIN_QUOTE
+/注意：这里以 MySQL 5.7 版本为基础讨论分区。/
+#+END_QUOTE
+
+* TODO Trace [4/4]                                                              :noexport:trace:
+  :LOGBOOK:
+  - State "TODO"       from              [2019-10-27 Sun 15:47]
+  :END:
+- [X] 方案
+  - [X] 方案设计概要
+  - [X] 评测案例和要求
+  - [X] 数据准备
+  - [X] 脚本准备
+- [X] 撰写结果汇总和分析
+- [X] 完善结论和建议
+- [X] 检查参考文献
+
+
+* 方案
+  :PROPERTIES:
+  :header-args: :engine mysql :dbhost localhost :dbuser root :database test :export both
+  :END:
+本节介绍 MySQL Partitioning 方案，有关该方案详细情况，请参阅 [[https://github.com/junahan/junahan-site/blob/master/org/s101/mysql-partitioning.org][MySQL 分区学习]]。
+
+** 方案概要
+根据应用的特点：
+- 这里选择基于 Range 做大表的分片。
+- 分片列为日期类型 - 对应用而言，最常用的访问集中在最近的一些数据。
+- 对于老的数据可以在日后通过分区裁剪整个移除。
+- 以数据的分布情况来确定分区的粒度 - 原则上保证每个分区的数据控制在百万级别。
+
+** 项目目录结构
+#+BEGIN_SRC shell :eval no
+.
+├── README.org
+├── data.zip
+├── sql
+│   ├── pt-a-hundred-millions-test.sql                # 1 亿规模数据表测试脚本
+│   ├── pt-a-millions-ref-test.sql                    # 100 万规模数据表，用于作为性能的基准参考
+│   ├── pt-prepare.sql                                # 数据库设置准备脚本，主要用于关闭 MySQL 缓存
+│   ├── pt-ten-millions-test.sql                      # 1000 万规模数据表测试脚本
+│   ├── pt-twenty-millions-test.sql                   # 2000 万规模数据表测试脚本
+│   ├── pt_a_hundred_millions_original_schema.sql     # 1 亿规模原始数据表
+│   ├── pt_a_millions_ref_schema.sql                  # 100 万规模数据表 schema
+│   ├── pt_base_goods_schema_and_data.sql             # 用于 Join 测试的数据表 schema 和数据
+│   ├── pt_ten_millions_original_schema.sql           # 1000 万规模数据表 schema 
+│   └── pt_twenty_millions_original_schema.sql        # 2000 万规模数据表 schema
+└── summary-mysql-partition.xlsx                      # the test result data.
+#+END_SRC
+
+- README.org - 本文档。
+- data.zip - 压缩后的测试数据，普通 CSV 文件。解压后可以直接导入 MySql 数据库。
+- sql - 测试表 Schema 以及测试脚本。详细请参看注释。
+- summary-mysql-partition.xlsx - 测试结果数据汇总。
+
+** 评测案例
+#+CAPTION: 评测案例说明
+| 测试案例/数据规模           | 备注说明                                                                                                                     |
+|-----------------------------+------------------------------------------------------------------------------------------------------------------------------|
+| Insert (以 100 条为单位)    | 测试 insert 操作性能，以 100 条数据为单位统计测试结果                                                                        |
+| 全表扫描                    | 使用 =SELECT COUNT(goods_name) FROM= 语句强制做全表扫描查询并统计测试结果                                                      |
+| 扫描约 500 万数据           | 使用 =SELECT COUNT(goods_name) FROM ... WHERE ...= 语句，使用分区列做条件限制扫描约 500 万数据并统计测试结果                   |
+| 扫描约 200 万数据           | 使用 =SELECT COUNT(goods_name) FROM ... WHERE ...= 语句，使用分区列做条件限制扫描约 200 万数据并统计测试结果                   |
+| 扫描约 100 万数据           | 使用 =SELECT COUNT(goods_name) FROM ... WHERE ...= 语句，使用分区列做条件限制扫描约 100 万数据并统计测试结果                   |
+| Left Join + 选择 100 万数据 | 使用 =SELECT COUNT(temp.id) FROM ... LEFT JOIN ... ON ... WHERE ...= 语句，使用分区列做条件限制扫描约 100 万数据并统计测试结果 |
+
+** 评测要求
+- 禁用数据库查询缓存 (query cache)
+- 所有测试案例均在原始表（未分区）和分区表分别执行和统计结果
+- 原始表和分区表具有相同的索引
+- 每个测试案例执行 5 (适用于运行时间较长的案例) 或者 10 次并丢弃明显不合理的结果
+- 所有测试分别在 1 千万，2 千万，1 亿三个数据量级上进行
+
+** 测试数据表结构及数据
+根据测评的要求，我们需要准备不同规模的测试数据。
+
+*** 测试表结构
+测试用表结构如下表所示：
+#+CAPTION: 测试表结构说明
+| 列名称     | 数据类型    | 是否索引 | 说明                                 |
+|------------+-------------+----------+--------------------------------------|
+| id         | varchar(32) | 是       | 本次测试中，在原始表中创建为主键索引 |
+| goods_id   | varchar(32) | 是       | 用于 Join 查询                       |
+| goods_name | varchar(32) | 否       | 不创建索引的列，用于测试             |
+| in_date    | datetime(4) | 是       | 用于分区表列                         |
+
+- id 列在原始表里面创建为主键索引，但在分区表里面为普通索引。这个和 MySQL Partitioning 的主键和唯一索引键限制有关。
+- goods_id 和 in_date 列分别在原始表和分区表创建索引。
+- goods_name 列表不加索引并在测试期间被用作 =SELECT count(goods_name) ...= 查询中，以执行可做性能对比的查询。
+
+*** 表结构脚本及数据
+下表是有关测试表结构 SQL 脚本以及相应的测试文件介绍。
+#+CAPTION: SQL 脚本和数据文件说明
+| 表结构脚本                                    | 数据文件                                    | 备注                                          |
+|-----------------------------------------------+---------------------------------------------+-----------------------------------------------|
+| sql/pt_base_goods_schema_and_data.sql         | N/A                                         | 用于 Join  测试的表结构脚本，包含了测试用数据 |
+| sql/pt_a_millions_ref_schema.sql              | data.zip/pt_a_millions_ref.csv              | 100 万参照测试数据表结构数据                  |
+| sql/pt_ten_millions_original_schema.sql       | data.zip/pt_ten_millions_original.csv       | 1,000 万规模测试表结构及数据                  |
+| sql/pt_twenty_millions_original_schema.sql    | data.zip/pt_twenty_millions_original.csv    | 2,000 万规模测试表结构及数据                  |
+| sql/pt_a_hundred_millions_original_schema.sql | data.zip/pt_a_hundred_millions_original.csv | 1 亿规模测试表结构及数据                      |
+
+** 测试脚本
+测试脚本是针对不同规模数据及测试案例制作的 SQL 脚本。测试脚本列表如下：
+#+CAPTION: 测试脚本说明
+| 数据规模           | 测试脚本                           | 说明                                           |
+|--------------------+------------------------------------+------------------------------------------------|
+| 数据库准备         | sql/pt-prepare.sql                 | 用于初始化和准备测试环境 - 包括关闭 MySQL 缓存 |
+| 1,000 万规模数据表 | sql/pt-ten-millions-test.sql       | 包含创建分区、所有测试案例语句等               |
+| 2,000 万规模数据表 | sql/pt-twenty-millions-test.sql    | 同上                                           |
+| 1 亿规模数据表     | sql/pt-a-hundred-millions-test.sql | 同上                                           |
+
+*** pt-prepare
+该脚本用于准备测试环境，如检查 MySQL 版本号和禁用缓存。
+
+**** 检查 MySQL 版本号
+需要 MySQL 5.7.0 以上版本。
+
+#+BEGIN_SRC sql :eval no
+-- 检查版本号 require > 5.7.0
+select @@version;
+
+#+RESULTS:
+| @@version |
+|-----------|
+|    5.7.25 |
+#+END_SRC
+
+**** 关闭 MySQL 缓存
+确保所有测试案例均在无缓存情况下运行以得到稳定且精确的执行时间统计。
+
+#+BEGIN_SRC sql :eval no
+-- 关闭 cache
+-- show variables like 'query_cache%';
+set GLOBAL query_cache_size = 0;
+set query_cache_type = off;
+show variables like 'query_cache%';
+
+#+RESULTS:
+| Variable_name                |   Value |
+|------------------------------+---------|
+| query_cache_limit            | 1048576 |
+| query_cache_min_res_unit     |    4096 |
+| query_cache_size             |       0 |
+| query_cache_type             |     OFF |
+| query_cache_wlock_invalidate |     OFF |
+#+END_SRC
+
+*** pt-ten-millions-test
+该脚本是 SQL 语句集合，用于 1,000 万数据规模场景下创建分区及运行全部测试案例。这里是[[file:sql/pt-ten-millions-test.sql][脚本源文件]]。
+
+**** 复制原始表
+为了对比测试，复制原始表用于创建分区表。
+
+#+BEGIN_SRC sql :eval no
+-- 复制表
+create table pt_ten_millions_partitioning_test as (select * from pt_ten_millions_original);
+#+END_SRC
+
+**** 统计数据分布情况
+使用已经创建好索引的原始表 (性能好) 统计数据按年、按月的分布情况，为创建分区做指引。
+
+- 统计 =in_date= 字段的范围
+#+BEGIN_SRC sql :eval no
+-- 统计 in_date 范围
+select max(in_date), min(in_date) from pt_ten_millions_original;
+
+#+RESULT:
+| max(in_date)             | min(in_date)             |
+|--------------------------+--------------------------|
+| 2017-09-30 00:00:00.0000 | 2017-01-01 00:00:00.0000 |
+#+END_SRC
+
+- 统计数据年度分布情况
+#+BEGIN_SRC sql :eval no
+-- 统计数据年度分布
+select YEAR(in_date), count(1) from pt_ten_millions_original group by YEAR(in_date);
+
+#+RESULT:
+| YEAR(in_date) | count(1) |
+|---------------+----------|
+|          2017 | 10000000 |
+#+END_SRC
+
+- 统计数据月度分布情况
+#+BEGIN_SRC sql :eval no
+-- 统计数据月度分布
+select MONTH(in_date), count(1) from pt_ten_millions_original where YEAR(in_date) = '2017' group by MONTH(in_date);
+
+#+RESULT:
+| MONTH(in_date) | count(1) |
+|----------------+----------|
+|              1 |  7059807 |
+|              2 |   821748 |
+|              3 |   306033 |
+|              4 |   290470 |
+|              5 |   322146 |
+|              6 |   279145 |
+|              7 |   294363 |
+|              8 |   316447 |
+|              9 |   309841 |
+#+END_SRC
+
+**** 设计分区并创建分区表
+根据数据分布情况的统计，可以看到多数数据集中在 2017 年 1 月份。为了遵循每个分片原则上数据量在 100 万规模级别，我们需要在创建分片的时候，考虑到 1 月份数据集中分布的情况。因此，1 月份是按照每三天左右一个分片来处理。分片的 SQL 脚本如下。
+
+#+BEGIN_SRC sql :eval no
+ALTER TABLE pt_ten_millions_partitioning_test PARTITION BY RANGE COLUMNS (in_date)
+(PARTITION p20161201 VALUES LESS THAN ('2016-12-01') ENGINE = InnoDB,
+ PARTITION p20170101 VALUES LESS THAN ('2017-01-01') ENGINE = InnoDB,
+ PARTITION p20170104 VALUES LESS THAN ('2017-01-04') ENGINE = InnoDB,
+ PARTITION p20170107 VALUES LESS THAN ('2017-01-07') ENGINE = InnoDB,
+ PARTITION p20170110 VALUES LESS THAN ('2017-01-10') ENGINE = InnoDB,
+ PARTITION p20170116 VALUES LESS THAN ('2017-01-16') ENGINE = InnoDB,
+ PARTITION p20170119 VALUES LESS THAN ('2017-01-19') ENGINE = InnoDB,
+ PARTITION p20170122 VALUES LESS THAN ('2017-01-22') ENGINE = InnoDB,
+ PARTITION p20170125 VALUES LESS THAN ('2017-01-25') ENGINE = InnoDB,
+ PARTITION p20170128 VALUES LESS THAN ('2017-01-28') ENGINE = InnoDB,
+ PARTITION p20170201 VALUES LESS THAN ('2017-02-01') ENGINE = InnoDB,
+ PARTITION p20170301 VALUES LESS THAN ('2017-03-01') ENGINE = InnoDB,
+ PARTITION p20170401 VALUES LESS THAN ('2017-04-01') ENGINE = InnoDB,
+ PARTITION p20170501 VALUES LESS THAN ('2017-05-01') ENGINE = InnoDB,
+ PARTITION p20170601 VALUES LESS THAN ('2017-06-01') ENGINE = InnoDB,
+ PARTITION p20170701 VALUES LESS THAN ('2017-07-01') ENGINE = InnoDB,
+ PARTITION p20170801 VALUES LESS THAN ('2017-08-01') ENGINE = InnoDB,
+ PARTITION p20170901 VALUES LESS THAN ('2017-09-01') ENGINE = InnoDB,
+ PARTITION p20171001 VALUES LESS THAN ('2017-10-01') ENGINE = InnoDB,
+ PARTITION p20171101 VALUES LESS THAN ('2017-11-01') ENGINE = InnoDB,
+ PARTITION p20171201 VALUES LESS THAN ('2017-12-01') ENGINE = InnoDB,
+ PARTITION p20180101 VALUES LESS THAN ('2018-01-01') ENGINE = InnoDB,
+ PARTITION p20999999 VALUES LESS THAN MAXVALUE ENGINE = InnoDB);
+#+END_SRC
+
+**** 为分区表创建索引
+为了对照测试结果，我们将和原始表一样，为分片表创建相应的索引 (不同的是 id 列的索引在原始表示主键索引，而在分片表则是普通索引)。
+
+#+BEGIN_SRC sql :eval no
+ALTER TABLE pt_ten_millions_partitioning_test
+      ADD INDEX pt_tmpt_id (id),
+			ADD INDEX pt_tmpt_goods_id (goods_id),
+			ADD INDEX pt_tmpt_in_date (in_date);
+#+END_SRC
+
+**** CASE 1 - 选择 100 万数据
+- 原始表 - 扫描约 100 万数据
+#+BEGIN_SRC sql :eval no
+-- SQL 执行计划分析
+explain select count(goods_name) from pt_ten_millions_original where in_date > '2017-02-01' and in_date < '2017-03-30';
+-- explain select count(id) from pt_ten_millions_original where in_date > '2017-02-01' and in_date < '2017-03-30';
+
+#+RESULT:
+| id | select_type | table                    | partitions | type | possible_keys  | key  | key_len | ref  |    rows | filtered | Extra       |
+|----+-------------+--------------------------+------------+------+----------------+------+---------+------+---------+----------+-------------|
+|  1 | SIMPLE      | pt_ten_millions_original | NULL       | ALL  | pt_tmo_in_date | NULL | NULL    | NULL | 9229334 |    21.36 | Using where |
+#+END_SRC
+#+BEGIN_QUOTE
+- 从执行分析结果来看，这个查询会使用到 in_date 列的索引。
+- 为什么使用 =count(goods_name)= 而非 =count(id)= 作为测试语句？
+ - =count(goods_name)= 模拟我们日常使用的查询 =SELECT id, goods_name FROM ...=
+ - 使用 =count(goods_name)= 返回最少数据以更加准确的统计 SQL 查询的执行性能
+#+END_QUOTE
+
+#+BEGIN_SRC sql :eval no
+select count(goods_name) from pt_ten_millions_original where in_date > '2017-02-01' and in_date < '2017-03-30';
+
+#+RESULT:
++-------------------+
+| count(goods_name) |
++-------------------+
+|           1085828 |
++-------------------+
+1 row in set (2.89 sec)
+#+END_SRC
+
+- 分片表 - 扫描约 100 万数据
+#+BEGIN_SRC sql :eval no
+-- SQL 执行计划分析
+explain select count(goods_name) from pt_ten_millions_partitioning_test where in_date > '2017-02-01' and in_date < '2017-03-30';
+
+#+RESULT:
++----+-------------+-----------------------------------+---------------------+------+-----------------+------+---------+------+---------+----------+-------------+
+| id | select_type | table                             | partitions          | type | possible_keys   | key  | key_len | ref  | rows    | filtered | Extra       |
++----+-------------+-----------------------------------+---------------------+------+-----------------+------+---------+------+---------+----------+-------------+
+|  1 | SIMPLE      | pt_ten_millions_partitioning_test | p20170301,p20170401 | ALL  | pt_tmpt_in_date | NULL | NULL    | NULL | 1126661 |    50.00 | Using where |
++----+-------------+-----------------------------------+---------------------+------+-----------------+------+---------+------+---------+----------+-------------+
+1 row in set, 1 warning (0.00 sec)
+#+END_SRC
+#+BEGIN_QUOTE
+- 从执行计划上看，需要扫描两个分片，可能使用 in_date 列索引。
+- 执行涉及的数据行大约是 1,126,661
+#+END_QUOTE
+
+#+BEGIN_SRC sql :eval no
+-- 执行 SQL 查询
+select count(goods_name) from pt_ten_millions_partitioning_test where in_date > '2017-02-01' and in_date < '2017-03-30';
+
+#+RESULT:
++-------------------+
+| count(goods_name) |
++-------------------+
+|           1086417 |
++-------------------+
+1 row in set (0.66 sec)
+#+END_SRC
+
+这个结果 *0.66* 秒相对于原始表选择相同规模数据的结果 (*2.89* 秒) 具有显著的优化效果。
+
+**** CASE 2 - 选择 200 万数据
+和 [[*CASE 1 - %E9%80%89%E6%8B%A9 100 %E4%B8%87%E6%95%B0%E6%8D%AE][CASE 1 - 选择 100 万数据]] 类似。
+**** CASE 3 - 选择 500 万数据
+和 [[*CASE 1 - %E9%80%89%E6%8B%A9 100 %E4%B8%87%E6%95%B0%E6%8D%AE][CASE 1 - 选择 100 万数据]] 类似。
+**** CASE 4 - Left Join + 选择 100 万数据
+- 在原始表 Left Join 执行计划和结果
+#+BEGIN_SRC sql :eval no
+mysql> 
+explain select count(t1.id) from pt_ten_millions_original as t1
+ left join pt_base_goods as base
+ on t1.goods_id = base.goods_id
+ where in_date > '2017-02-01' and in_date < '2017-03-30';
+
+mysql>
++----+-------------+-------+------------+------+--------------------+--------------------+---------+------------------+---------+----------+--------------------------+
+| id | select_type | table | partitions | type | possible_keys      | key                | key_len | ref              | rows    | filtered | Extra                    |
++----+-------------+-------+------------+------+--------------------+--------------------+---------+------------------+---------+----------+--------------------------+
+|  1 | SIMPLE      | t1    | NULL       | ALL  | pt_tmo_in_date     | NULL               | NULL    | NULL             | 9229334 |    21.36 | Using where              |
+|  1 | SIMPLE      | base  | NULL       | ref  | index_pbg_goods_id | index_pbg_goods_id | 26      | test.t1.goods_id |       1 |   100.00 | Using where; Using index |
++----+-------------+-------+------------+------+--------------------+--------------------+---------+------------------+---------+----------+--------------------------+
+2 rows in set, 1 warning (0.04 sec)
+#+END_SRC
+
+#+BEGIN_SRC sql :eval no
+mysql> 
+select count(t1.id) from pt_ten_millions_original as t1
+ left join pt_base_goods as base
+ on t1.goods_id = base.goods_id
+ where in_date > '2017-02-01' and in_date < '2017-03-30';
+
+mysql>
++--------------+
+| count(t1.id) |
++--------------+
+|      1085828 |
++--------------+
+1 row in set (5.18 sec)
+#+END_SRC
+
+- 分片表 Left Join 执行计划和结果
+#+BEGIN_SRC sql :eval no
+mysql> 
+explain select count(t1.id) from pt_ten_millions_partitioning_test as t1
+ left join pt_base_goods as base
+ on t1.goods_id = base.goods_id
+ where in_date > '2017-02-01' and in_date < '2017-03-30';
+
+mysql>
++----+-------------+-------+---------------------+------+--------------------+--------------------+---------+------------------+---------+----------+--------------------------+
+| id | select_type | table | partitions          | type | possible_keys      | key                | key_len | ref              | rows    | filtered | Extra                    |
++----+-------------+-------+---------------------+------+--------------------+--------------------+---------+------------------+---------+----------+--------------------------+
+|  1 | SIMPLE      | t1    | p20170301,p20170401 | ALL  | pt_tmpt_in_date    | NULL               | NULL    | NULL             | 1126661 |    50.00 | Using where              |
+|  1 | SIMPLE      | base  | NULL                | ref  | index_pbg_goods_id | index_pbg_goods_id | 26      | test.t1.goods_id |       1 |   100.00 | Using where; Using index |
++----+-------------+-------+---------------------+------+--------------------+--------------------+---------+------------------+---------+----------+--------------------------+
+2 rows in set, 1 warning (0.00 sec)
+#+END_SRC
+
+#+BEGIN_SRC sql :eval no
+mysql> 
+select count(t1.id) from pt_ten_millions_partitioning_test as t1
+ left join pt_base_goods as base
+ on t1.goods_id = base.goods_id
+ where in_date > '2017-02-01' and in_date < '2017-03-30';
+
+mysql>
++--------------+
+| count(t1.id) |
++--------------+
+|      1086417 |
++--------------+
+1 row in set (2.54 sec)
+#+END_SRC
+
+* 结果汇总分析
+#+BEGIN_QUOTE
+测试条件：
+- MacBook Pro (CPU 2.3 GHz Intel Core i5/ 	Memory 8G)
+- MySQL 默认配置
+- 关闭 MySQL 查询缓存
+#+END_QUOTE
+
+#+CAPTION: 不同规模数据下的对照结果
+#+ATTR_HTML:  :width 80%
+https://tva1.sinaimg.cn/large/006y8mN6gy1g8rvopjnsdj30zk0be0ve.jpg
+
+#+BEGIN_QUOTE
+- Insert 操作在无分片和分片表之间几乎无差别，且在不同数据集规模下的差别也不是太显著
+- 全表扫描测试案例 - 分片表比未分片稍慢
+- 随着扫描数据量范围收窄，分片表性能依次大幅度上升，在不同规模数据集上表现一致
+- 数据规模达到 1 亿后，原始表查询性能在大多数情况下表现很差
+#+END_QUOTE
+
+#+CAPTION: 不同规模数据下分片性能表现
+#+ATTR_HTML:  :width 80%
+https://tva1.sinaimg.cn/large/006y8mN6ly1g8s45pae8qj30xe0ccmyn.jpg
+
+#+BEGIN_QUOTE
+- 分片表在各种数据规模下的表现一致，和查询扫描的数据量有关
+- 随着查询扫描的数据量越大，性能越差
+- 全表扫描要比原始表性能稍差 - 这里为了显示问题没有列出全表扫描的结果
+- 慎用大表 Left Join，其性能取决于查询要扫描的数据规模
+#+END_QUOTE
+
+* 结论和建议
+经过以上的数据汇总和分析，我们可以得出如下几个结论：
+- 没有银弹，分片方案需要应用和的配合，在查询的时候要利用分片列作为条件来减少需要扫描的数据。范围越小，使用分片的优化效果越发显著。
+- 根据业务查询的特点，合理的规划和使用分片方案可以带来性能的大幅度提升。如业务上查询大多可以根据时间或者其他因素收窄查询条件以大幅度缩小需要扫描的数据量。
+- 谨慎对大表执行 Left Join。性能显然差强人意。
+
+* 参考文献
+1. [[https://dev.mysql.com/doc/refman/5.7/en/partitioning.html][MySQL 5.7 Reference Manual - Partitioning]], Oracle, 2019.
+2. [[https://github.com/junahan/junahan-site/blob/master/org/s101/mysql-partitioning.org][MySQL 分片学习]], by Junahan, 2019.
